@@ -16,7 +16,8 @@ import functools
 import custom_datasets
 from multiprocessing.pool import ThreadPool
 import time
-
+import vllm
+from icecream import ic
 
 
 # 15 colorblind-friendly colors
@@ -514,9 +515,11 @@ def run_perturbation_experiment(results, criterion, span_length=10, n_perturbati
     }
 
 
-def run_baseline_threshold_experiment(criterion_fn, name, n_samples=500):
+def run_baseline_threshold_experiment(data, criterion_fn, name, n_samples=500):
     torch.manual_seed(0)
     np.random.seed(0)
+
+    ic(data)
 
     results = []
     for batch in tqdm.tqdm(range(n_samples // batch_size), desc=f"Computing {name} criterion"):
@@ -594,6 +597,8 @@ def generate_samples(raw_data, batch_size):
         "sampled": [],
     }
 
+    ic(type(raw_data))
+
     for batch in range(len(raw_data) // batch_size):
         print('Generating samples for batch', batch, 'of', len(raw_data) // batch_size)
         original_text = raw_data[batch * batch_size:(batch + 1) * batch_size]
@@ -616,6 +621,8 @@ def generate_samples(raw_data, batch_size):
         data["sampled"] = perturb_texts(data["sampled"], args.pre_perturb_span_length, args.pre_perturb_pct, ceil_pct=True)
         load_base_model()
 
+    ic(len(data["original"]), len(data["sampled"]))
+
     return data
 
 
@@ -624,7 +631,7 @@ def generate_data(dataset, key):
     if dataset in custom_datasets.DATASETS:
         data = custom_datasets.load(dataset, cache_dir)
     else:
-        data = datasets.load_dataset(dataset, split='train', cache_dir=cache_dir)[key]
+        data = datasets.load_dataset(dataset, split='train', cache_dir=cache_dir, trust_remote_code=True)[key]
 
     # get unique examples, strip whitespace, and remove newlines
     # then take just the long examples, shuffle, take the first 5,000 to tokenize to save time
@@ -873,7 +880,7 @@ if __name__ == '__main__':
         json.dump(data, f)
 
     if not args.skip_baselines:
-        baseline_outputs = [run_baseline_threshold_experiment(get_ll, "likelihood", n_samples=n_samples)]
+        baseline_outputs = [run_baseline_threshold_experiment(data, get_ll, "likelihood", n_samples=n_samples)]
         if args.openai_model is None:
             rank_criterion = lambda text: -get_rank(text, log=False)
             baseline_outputs.append(run_baseline_threshold_experiment(rank_criterion, "rank", n_samples=n_samples))
