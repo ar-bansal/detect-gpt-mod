@@ -16,9 +16,12 @@ import functools
 import custom_datasets
 from multiprocessing.pool import ThreadPool
 import time
-import vllm
+from typing import * 
+from vllm import LLM, SamplingParams
 from icecream import ic
 
+
+vllm_mask_client = None 
 
 # 15 colorblind-friendly colors
 COLORS = ["#0072B2", "#009E73", "#D55E00", "#CC79A7", "#F0E442",
@@ -29,16 +32,17 @@ COLORS = ["#0072B2", "#009E73", "#D55E00", "#CC79A7", "#F0E442",
 pattern = re.compile(r"<extra_id_\d+>")
 
 
-def load_base_model():
-    print('MOVING BASE MODEL TO GPU...', end='', flush=True)
-    start = time.time()
-    try:
-        mask_model.cpu()
-    except NameError:
-        pass
-    if args.openai_model is None:
-        base_model.to(DEVICE)
-    print(f'DONE ({time.time() - start:.2f}s)')
+# def load_base_model():
+#     print('MOVING BASE MODEL TO GPU...', end='', flush=True)
+#     start = time.time()
+#     try:
+#         mask_model.cpu()
+#     except NameError:
+#         pass
+#     if args.openai_model is None:
+#         base_model.to(DEVICE)
+#     print(f'DONE ({time.time() - start:.2f}s)')
+
 
 
 def load_mask_model():
@@ -48,7 +52,12 @@ def load_mask_model():
     if args.openai_model is None:
         base_model.cpu()
     if not args.random_fills:
-        mask_model.to(DEVICE)
+    #     mask_model.to(DEVICE)
+        try: 
+            if mask_model is not None: 
+                mask_model.to(DEVICE)
+        except Exception: 
+            pass 
     print(f'DONE ({time.time() - start:.2f}s)')
 
 
@@ -86,13 +95,53 @@ def count_masks(texts):
     return [len([x for x in text.split() if x.startswith("<extra_id_")]) for text in texts]
 
 
+# # replace each masked span with a sample from T5 mask_model
+# def replace_masks(texts):
+#     n_expected = count_masks(texts)
+#     # stop_id = mask_tokenizer.encode(f"<extra_id_{max(n_expected)}>")[0]
+#     # tokens = mask_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
+#     # outputs = mask_model.generate(**tokens, max_length=150, do_sample=True, top_p=args.mask_top_p, num_return_sequences=1, eos_token_id=stop_id)
+#     # return mask_tokenizer.batch_decode(outputs, skip_special_tokens=False)
+
+#     if args.use_vllm and vllm_mask_client is not None:
+#         prefixes = texts
+#         sampling_params = SamplingParams(temperature=1.0, top_p=args.mask_top_p)
+#         outputs = []
+#         # vllm.generate yields responses; collect generated raw text for each prompt
+#         with vllm_mask_client.generate(prompts=prefixes, sampling_params=sampling_params, max_tokens=150) as gen:
+#             for response in gen:
+#                 for out in response.outputs:
+#                     # out.text is the continuation; vllm does not include the prompt by default in out.text,
+#                     # but downstream extract_fills expects the model output that includes <extra_id_*> tokens,
+#                     # so we append the raw out.text here.
+#                     outputs.append(out.text)
+#         # Return raw generated strings (not token-decoded by mask_tokenizer) so downstream functions can extract fills.
+#         return outputs
+#     else:
+#         stop_id = mask_tokenizer.encode(f"<extra_id_{max(n_expected)}>")[0]
+#         tokens = mask_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
+#         outputs = mask_model.generate(**tokens, max_length=150, do_sample=True, top_p=args.mask_top_p, num_return_sequences=1, eos_token_id=stop_id)
+#         return mask_tokenizer.batch_decode(outputs, skip_special_tokens=False)
+
+
 # replace each masked span with a sample from T5 mask_model
-def replace_masks(texts):
+def replace_masks_vllm(texts):
     n_expected = count_masks(texts)
-    stop_id = mask_tokenizer.encode(f"<extra_id_{max(n_expected)}>")[0]
-    tokens = mask_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
-    outputs = mask_model.generate(**tokens, max_length=150, do_sample=True, top_p=args.mask_top_p, num_return_sequences=1, eos_token_id=stop_id)
-    return mask_tokenizer.batch_decode(outputs, skip_special_tokens=False)
+    # stop_id = mask_tokenizer.encode(f"<extra_id_{max(n_expected)}>")[0]
+    # tokens = mask_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
+    # outputs = mask_model.generate(**tokens, max_length=150, do_sample=True, top_p=args.mask_top_p, num_return_sequences=1, eos_token_id=stop_id)
+    # return mask_tokenizer.batch_decode(outputs, skip_special_tokens=False)
+
+    if args.use_vllm and vllm_mask_client is not None:
+        prefixes = texts
+        sampling_params = SamplingParams(temperature=1.0, top_p=args.mask_top_p, stop=[f"<extra_id_{max(n_expected)}>"])
+        outputs = vllm_mask_client.generate(prefixes, sampling_params, max_tokens=150) 
+        return outputs
+    else:
+        stop_id = mask_tokenizer.encode(f"<extra_id_{max(n_expected)}>")[0]
+        tokens = mask_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
+        outputs = mask_model.generate(**tokens, max_length=150, do_sample=True, top_p=args.mask_top_p, num_return_sequences=1, eos_token_id=stop_id)
+        return mask_tokenizer.batch_decode(outputs, skip_special_tokens=False)
 
 
 def extract_fills(texts):
@@ -127,41 +176,89 @@ def apply_extracted_fills(masked_texts, extracted_fills):
     return texts
 
 
-def perturb_texts_(texts, span_length, pct, ceil_pct=False):
+# def perturb_texts_(texts, span_length, pct, ceil_pct=False):
+#     if not args.random_fills:
+#         masked_texts = [tokenize_and_mask(x, span_length, pct, ceil_pct) for x in texts]
+#         raw_fills = replace_masks(masked_texts)
+#         extracted_fills = extract_fills(raw_fills)
+#         perturbed_texts = apply_extracted_fills(masked_texts, extracted_fills)
+
+#         # Handle the fact that sometimes the model doesn't generate the right number of fills and we have to try again
+#         attempts = 1
+#         while '' in perturbed_texts:
+#             idxs = [idx for idx, x in enumerate(perturbed_texts) if x == '']
+#             print(f'WARNING: {len(idxs)} texts have no fills. Trying again [attempt {attempts}].')
+#             masked_texts = [tokenize_and_mask(x, span_length, pct, ceil_pct) for idx, x in enumerate(texts) if idx in idxs]
+#             raw_fills = replace_masks(masked_texts)
+#             extracted_fills = extract_fills(raw_fills)
+#             new_perturbed_texts = apply_extracted_fills(masked_texts, extracted_fills)
+#             for idx, x in zip(idxs, new_perturbed_texts):
+#                 perturbed_texts[idx] = x
+#             attempts += 1
+#     else:
+#         if args.random_fills_tokens:
+#             # tokenize base_tokenizer
+#             tokens = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
+#             valid_tokens = tokens.input_ids != base_tokenizer.pad_token_id
+#             replace_pct = args.pct_words_masked * (args.span_length / (args.span_length + 2 * args.buffer_size))
+
+#             # replace replace_pct of input_ids with random tokens
+#             random_mask = torch.rand(tokens.input_ids.shape, device=DEVICE) < replace_pct
+#             random_mask &= valid_tokens
+#             random_tokens = torch.randint(0, base_tokenizer.vocab_size, (random_mask.sum(),), device=DEVICE)
+#             # while any of the random tokens are special tokens, replace them with random non-special tokens
+#             while any(base_tokenizer.decode(x) in base_tokenizer.all_special_tokens for x in random_tokens):
+#                 random_tokens = torch.randint(0, base_tokenizer.vocab_size, (random_mask.sum(),), device=DEVICE)
+#             tokens.input_ids[random_mask] = random_tokens
+#             perturbed_texts = base_tokenizer.batch_decode(tokens.input_ids, skip_special_tokens=True)
+#         else:
+#             masked_texts = [tokenize_and_mask(x, span_length, pct, ceil_pct) for x in texts]
+#             perturbed_texts = masked_texts
+#             # replace each <extra_id_*> with args.span_length random words from FILL_DICTIONARY
+#             for idx, text in enumerate(perturbed_texts):
+#                 filled_text = text
+#                 for fill_idx in range(count_masks([text])[0]):
+#                     fill = random.sample(FILL_DICTIONARY, span_length)
+#                     filled_text = filled_text.replace(f"<extra_id_{fill_idx}>", " ".join(fill))
+#                 assert count_masks([filled_text])[0] == 0, "Failed to replace all masks"
+#                 perturbed_texts[idx] = filled_text
+
+#     return perturbed_texts
+
+
+def perturb_texts_vllm_(texts, span_length, pct, ceil_pct=False):
     if not args.random_fills:
         masked_texts = [tokenize_and_mask(x, span_length, pct, ceil_pct) for x in texts]
-        raw_fills = replace_masks(masked_texts)
+        raw_fills = replace_masks_vllm(masked_texts)
         extracted_fills = extract_fills(raw_fills)
         perturbed_texts = apply_extracted_fills(masked_texts, extracted_fills)
-
-        # Handle the fact that sometimes the model doesn't generate the right number of fills and we have to try again
-        attempts = 1
-        while '' in perturbed_texts:
-            idxs = [idx for idx, x in enumerate(perturbed_texts) if x == '']
-            print(f'WARNING: {len(idxs)} texts have no fills. Trying again [attempt {attempts}].')
-            masked_texts = [tokenize_and_mask(x, span_length, pct, ceil_pct) for idx, x in enumerate(texts) if idx in idxs]
-            raw_fills = replace_masks(masked_texts)
-            extracted_fills = extract_fills(raw_fills)
-            new_perturbed_texts = apply_extracted_fills(masked_texts, extracted_fills)
-            for idx, x in zip(idxs, new_perturbed_texts):
-                perturbed_texts[idx] = x
-            attempts += 1
     else:
         if args.random_fills_tokens:
-            # tokenize base_tokenizer
-            tokens = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
-            valid_tokens = tokens.input_ids != base_tokenizer.pad_token_id
+            perturbed_texts = [] 
             replace_pct = args.pct_words_masked * (args.span_length / (args.span_length + 2 * args.buffer_size))
+            pad_token_id = base_tokenizer.pad_token_id 
+            special_ids = set(base_tokenizer.all_special_ids) 
+            vocab_size = base_tokenizer.vocab_size 
 
-            # replace replace_pct of input_ids with random tokens
-            random_mask = torch.rand(tokens.input_ids.shape, device=DEVICE) < replace_pct
-            random_mask &= valid_tokens
-            random_tokens = torch.randint(0, base_tokenizer.vocab_size, (random_mask.sum(),), device=DEVICE)
-            # while any of the random tokens are special tokens, replace them with random non-special tokens
-            while any(base_tokenizer.decode(x) in base_tokenizer.all_special_tokens for x in random_tokens):
-                random_tokens = torch.randint(0, base_tokenizer.vocab_size, (random_mask.sum(),), device=DEVICE)
-            tokens.input_ids[random_mask] = random_tokens
-            perturbed_texts = base_tokenizer.batch_decode(tokens.input_ids, skip_special_tokens=True)
+            tokenized = base_tokenizer(texts, padding=True, return_tensors=None) 
+            for input_ids in tokenized["input_ids"]:
+                new_ids = [] 
+                for tok in input_ids: 
+                    if tok == pad_token_id: 
+                        new_ids.append(tok) 
+                        continue 
+
+                    if random.random() < replace_pct: 
+                        rand_tok = random.randint(0, vocab_size - 1) 
+                        while rank_tok in special_ids: 
+                            rank_tok = random.randint(0, vocab_size - 1) 
+
+                        new_ids.append(rand_tok)
+                    else:
+                        new_ids.append(tok) 
+            
+                text = base_tokenizer.decode(new_ids, skip_special_tokens=True) 
+                perturbed_texts.append(text) 
         else:
             masked_texts = [tokenize_and_mask(x, span_length, pct, ceil_pct) for x in texts]
             perturbed_texts = masked_texts
@@ -177,14 +274,25 @@ def perturb_texts_(texts, span_length, pct, ceil_pct=False):
     return perturbed_texts
 
 
-def perturb_texts(texts, span_length, pct, ceil_pct=False):
+
+# def perturb_texts(texts, span_length, pct, ceil_pct=False):
+#     chunk_size = args.chunk_size
+#     if '11b' in mask_filling_model_name:
+#         chunk_size //= 2
+
+#     outputs = []
+#     for i in tqdm.tqdm(range(0, len(texts), chunk_size), desc="Applying perturbations"):
+#         outputs.extend(perturb_texts_(texts[i:i + chunk_size], span_length, pct, ceil_pct=ceil_pct))
+#     return outputs
+
+def perturb_texts_vllm(texts, span_length, pct, ceil_pct=False):
     chunk_size = args.chunk_size
     if '11b' in mask_filling_model_name:
         chunk_size //= 2
 
     outputs = []
     for i in tqdm.tqdm(range(0, len(texts), chunk_size), desc="Applying perturbations"):
-        outputs.extend(perturb_texts_(texts[i:i + chunk_size], span_length, pct, ceil_pct=ceil_pct))
+        outputs.extend(perturb_texts_vllm_(texts[i:i + chunk_size], span_length, pct, ceil_pct=ceil_pct))
     return outputs
 
 
@@ -206,7 +314,7 @@ def _openai_sample(p):
 
 
 # sample from base_model using ****only**** the first 30 tokens in each example as context
-def sample_from_model(texts, min_words=55, prompt_tokens=30):
+def sample_from_model(texts: List[str], min_words: int = 55, prompt_tokens: int = 30):
     # encode each text as a list of token ids
     if args.dataset == 'pubmed':
         texts = [t[:t.index(custom_datasets.SEPARATOR)] for t in texts]
@@ -221,6 +329,19 @@ def sample_from_model(texts, min_words=55, prompt_tokens=30):
         pool = ThreadPool(args.batch_size)
 
         decoded = pool.map(_openai_sample, prefixes)
+        return decoded 
+
+    if args.use_vllm and vllm_client is not None:
+        sampling_params = SamplingParams(
+            temperature=1.0, 
+            top_p=args.top_p if args.do_top_p else 1.0,
+            top_k=args.top_k if args.do_top_k else None, 
+            logprobs=1
+        )
+
+        decoded = vllm_client.generate(texts, sampling_params=sampling_params, min_tokens=min_words, max_tokens=200)
+        return decoded
+        
     else:
         decoded = ['' for _ in range(len(texts))]
 
@@ -242,48 +363,85 @@ def sample_from_model(texts, min_words=55, prompt_tokens=30):
             decoded = base_tokenizer.batch_decode(outputs, skip_special_tokens=True)
             tries += 1
 
-    if args.openai_model:
-        global API_TOKEN_COUNTER
+    # if args.openai_model:
+    #     global API_TOKEN_COUNTER
 
-        # count total number of tokens with GPT2_TOKENIZER
-        total_tokens = sum(len(GPT2_TOKENIZER.encode(x)) for x in decoded)
-        API_TOKEN_COUNTER += total_tokens
+    #     # count total number of tokens with GPT2_TOKENIZER
+    #     total_tokens = sum(len(GPT2_TOKENIZER.encode(x)) for x in decoded)
+    #     API_TOKEN_COUNTER += total_tokens
 
     return decoded
 
 
-def get_likelihood(logits, labels):
-    assert logits.shape[0] == 1
-    assert labels.shape[0] == 1
+# def get_likelihood(logits, labels):
+#     assert logits.shape[0] == 1
+#     assert labels.shape[0] == 1
 
-    logits = logits.view(-1, logits.shape[-1])[:-1]
-    labels = labels.view(-1)[1:]
-    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-    log_likelihood = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-    return log_likelihood.mean()
+#     logits = logits.view(-1, logits.shape[-1])[:-1]
+#     labels = labels.view(-1)[1:]
+#     log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+#     log_likelihood = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+#     return log_likelihood.mean()
+
+def get_likelihood(outputs): 
+    return [o.outputs[0].cumulative_logprob / len(o.outputs[0].token_ids) for o in outputs]
 
 
 # Get the log likelihood of each text under the base_model
-def get_ll(text):
-    if args.openai_model:        
-        kwargs = { "engine": args.openai_model, "temperature": 0, "max_tokens": 0, "echo": True, "logprobs": 0}
-        r = openai.Completion.create(prompt=f"<|endoftext|>{text}", **kwargs)
-        result = r['choices'][0]
-        tokens, logprobs = result["logprobs"]["tokens"][1:], result["logprobs"]["token_logprobs"][1:]
+# def get_ll(text):
+#     if args.openai_model:        
+#         kwargs = { "engine": args.openai_model, "temperature": 0, "max_tokens": 0, "echo": True, "logprobs": 0}
+#         r = openai.Completion.create(prompt=f"<|endoftext|>{text}", **kwargs)
+#         result = r['choices'][0]
+#         tokens, logprobs = result["logprobs"]["tokens"][1:], result["logprobs"]["token_logprobs"][1:]
 
-        assert len(tokens) == len(logprobs), f"Expected {len(tokens)} logprobs, got {len(logprobs)}"
+#         assert len(tokens) == len(logprobs), f"Expected {len(tokens)} logprobs, got {len(logprobs)}"
 
-        return np.mean(logprobs)
-    else:
-        with torch.no_grad():
-            tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
-            labels = tokenized.input_ids
-            return -base_model(**tokenized, labels=labels).loss.item()
+#         return np.mean(logprobs)
+#     else:
+#         with torch.no_grad():
+#             tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
+#             labels = tokenized.input_ids
+#             return -base_model(**tokenized, labels=labels).loss.item()
+
+# Get the log likelihood of each text under the base_model
+# TODO: refactor to use vllm outputs correctly 
+def get_ll_vllm(data):
+    return [d.outputs[0].logprobs for d in data]
+    # if args.openai_model:        
+    #     kwargs = { "engine": args.openai_model, "temperature": 0, "max_tokens": 0, "echo": True, "logprobs": 0}
+    #     r = openai.Completion.create(prompt=f"<|endoftext|>{text}", **kwargs)
+    #     result = r['choices'][0]
+    #     tokens, logprobs = result["logprobs"]["tokens"][1:], result["logprobs"]["token_logprobs"][1:]
+
+    #     assert len(tokens) == len(logprobs), f"Expected {len(tokens)} logprobs, got {len(logprobs)}"
+
+    #     return np.mean(logprobs)
+    # else:
+        # with torch.no_grad():
+        #     tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
+        #     labels = tokenized.input_ids
+        #     return -base_model(**tokenized, labels=labels).loss.item()
 
 
-def get_lls(texts):
+# def get_lls(texts):
+#     if not args.openai_model:
+#         return [get_ll(text) for text in texts]
+#     else:
+#         global API_TOKEN_COUNTER
+
+#         # use GPT2_TOKENIZER to get total number of tokens
+#         total_tokens = sum(len(GPT2_TOKENIZER.encode(text)) for text in texts)
+#         API_TOKEN_COUNTER += total_tokens * 2  # multiply by two because OpenAI double-counts echo_prompt tokens
+
+#         pool = ThreadPool(args.batch_size)
+#         return pool.map(get_ll, texts)
+
+
+
+def get_lls_vllm(texts):
     if not args.openai_model:
-        return [get_ll(text) for text in texts]
+        return [get_ll_vllm(text) for text in texts]
     else:
         global API_TOKEN_COUNTER
 
@@ -292,37 +450,79 @@ def get_lls(texts):
         API_TOKEN_COUNTER += total_tokens * 2  # multiply by two because OpenAI double-counts echo_prompt tokens
 
         pool = ThreadPool(args.batch_size)
-        return pool.map(get_ll, texts)
+        return pool.map(get_ll_vllm, texts)
 
 
 # get the average rank of each observed token sorted by model likelihood
-def get_rank(text, log=False):
+# def get_rank(text, log=False):
+#     assert args.openai_model is None, "get_rank not implemented for OpenAI models"
+
+#     with torch.no_grad():
+#         tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
+#         logits = base_model(**tokenized).logits[:,:-1]
+#         labels = tokenized.input_ids[:,1:]
+
+#         # get rank of each label token in the model's likelihood ordering
+#         matches = (logits.argsort(-1, descending=True) == labels.unsqueeze(-1)).nonzero()
+
+#         assert matches.shape[1] == 3, f"Expected 3 dimensions in matches tensor, got {matches.shape}"
+
+#         ranks, timesteps = matches[:,-1], matches[:,-2]
+
+#         # make sure we got exactly one match for each timestep in the sequence
+#         assert (timesteps == torch.arange(len(timesteps)).to(timesteps.device)).all(), "Expected one match per timestep"
+
+#         ranks = ranks.float() + 1 # convert to 1-indexed rank
+#         if log:
+#             ranks = torch.log(ranks)
+
+#         return ranks.float().mean().item()
+
+def get_rank_vllm(data, log=False):
     assert args.openai_model is None, "get_rank not implemented for OpenAI models"
 
-    with torch.no_grad():
-        tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
-        logits = base_model(**tokenized).logits[:,:-1]
-        labels = tokenized.input_ids[:,1:]
+    ranks = [d.outputs[0].rank for d in data]
+    ranks = torch.tensor(ranks, dtype=torch.float32)
+    ranks = ranks + 1 
+    if log: 
+        ranks = torch.log(ranks) 
 
-        # get rank of each label token in the model's likelihood ordering
-        matches = (logits.argsort(-1, descending=True) == labels.unsqueeze(-1)).nonzero()
+    return ranks 
 
-        assert matches.shape[1] == 3, f"Expected 3 dimensions in matches tensor, got {matches.shape}"
+    # with torch.no_grad():
+    #     tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
+    #     logits = base_model(**tokenized).logits[:,:-1]
+    #     labels = tokenized.input_ids[:,1:]
 
-        ranks, timesteps = matches[:,-1], matches[:,-2]
+    #     # get rank of each label token in the model's likelihood ordering
+    #     matches = (logits.argsort(-1, descending=True) == labels.unsqueeze(-1)).nonzero()
 
-        # make sure we got exactly one match for each timestep in the sequence
-        assert (timesteps == torch.arange(len(timesteps)).to(timesteps.device)).all(), "Expected one match per timestep"
+    #     assert matches.shape[1] == 3, f"Expected 3 dimensions in matches tensor, got {matches.shape}"
 
-        ranks = ranks.float() + 1 # convert to 1-indexed rank
-        if log:
-            ranks = torch.log(ranks)
+    #     ranks, timesteps = matches[:,-1], matches[:,-2]
 
-        return ranks.float().mean().item()
+    #     # make sure we got exactly one match for each timestep in the sequence
+    #     assert (timesteps == torch.arange(len(timesteps)).to(timesteps.device)).all(), "Expected one match per timestep"
+
+    #     ranks = ranks.float() + 1 # convert to 1-indexed rank
+    #     if log:
+    #         ranks = torch.log(ranks)
+
+    #     return ranks.float().mean().item()
 
 
 # get average entropy of each token in the text
-def get_entropy(text):
+# def get_entropy(text):
+#     assert args.openai_model is None, "get_entropy not implemented for OpenAI models"
+
+#     with torch.no_grad():
+#         tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
+#         logits = base_model(**tokenized).logits[:,:-1]
+#         neg_entropy = F.softmax(logits, dim=-1) * F.log_softmax(logits, dim=-1)
+#         return -neg_entropy.sum(-1).mean().item()
+
+# TODO: Implement get_entropy_vllm 
+def get_entropy_vllm(text):
     assert args.openai_model is None, "get_entropy not implemented for OpenAI models"
 
     with torch.no_grad():
@@ -418,8 +618,56 @@ def save_llr_histograms(experiments):
             pass
 
 
-def get_perturbation_results(span_length=10, n_perturbations=1, n_samples=500):
-    load_mask_model()
+# def get_perturbation_results(span_length=10, n_perturbations=1, n_samples=500):
+#     load_mask_model()
+
+#     torch.manual_seed(0)
+#     np.random.seed(0)
+
+#     results = []
+#     original_text = data["original"]
+#     sampled_text = data["sampled"]
+
+#     perturb_fn = functools.partial(perturb_texts, span_length=span_length, pct=args.pct_words_masked)
+
+#     p_sampled_text = perturb_fn([x for x in sampled_text for _ in range(n_perturbations)])
+#     p_original_text = perturb_fn([x for x in original_text for _ in range(n_perturbations)])
+#     for _ in range(n_perturbation_rounds - 1):
+#         try:
+#             p_sampled_text, p_original_text = perturb_fn(p_sampled_text), perturb_fn(p_original_text)
+#         except AssertionError:
+#             break
+
+#     assert len(p_sampled_text) == len(sampled_text) * n_perturbations, f"Expected {len(sampled_text) * n_perturbations} perturbed samples, got {len(p_sampled_text)}"
+#     assert len(p_original_text) == len(original_text) * n_perturbations, f"Expected {len(original_text) * n_perturbations} perturbed samples, got {len(p_original_text)}"
+
+#     for idx in range(len(original_text)):
+#         results.append({
+#             "original": original_text[idx],
+#             "sampled": sampled_text[idx],
+#             "perturbed_sampled": p_sampled_text[idx * n_perturbations: (idx + 1) * n_perturbations],
+#             "perturbed_original": p_original_text[idx * n_perturbations: (idx + 1) * n_perturbations]
+#         })
+
+#     load_base_model()
+
+#     for res in tqdm.tqdm(results, desc="Computing log likelihoods"):
+#         p_sampled_ll = get_lls(res["perturbed_sampled"])
+#         p_original_ll = get_lls(res["perturbed_original"])
+#         res["original_ll"] = get_ll(res["original"])
+#         res["sampled_ll"] = get_ll(res["sampled"])
+#         res["all_perturbed_sampled_ll"] = p_sampled_ll
+#         res["all_perturbed_original_ll"] = p_original_ll
+#         res["perturbed_sampled_ll"] = np.mean(p_sampled_ll)
+#         res["perturbed_original_ll"] = np.mean(p_original_ll)
+#         res["perturbed_sampled_ll_std"] = np.std(p_sampled_ll) if len(p_sampled_ll) > 1 else 1
+#         res["perturbed_original_ll_std"] = np.std(p_original_ll) if len(p_original_ll) > 1 else 1
+
+#     return results
+
+
+def get_perturbation_results_vllm(span_length=10, n_perturbations=1, n_samples=500):
+    # load_mask_model()
 
     torch.manual_seed(0)
     np.random.seed(0)
@@ -428,8 +676,15 @@ def get_perturbation_results(span_length=10, n_perturbations=1, n_samples=500):
     original_text = data["original"]
     sampled_text = data["sampled"]
 
-    perturb_fn = functools.partial(perturb_texts, span_length=span_length, pct=args.pct_words_masked)
+    # p_sampled_text = [] 
+    # for x in sampled_text: 
+    #     p_sampled_text.append(perturb_texts_vllm(x, span_length=span_length, pct=args.pct_words_masked)[0]) 
 
+    # p_original_text = [] 
+    # for x in original_text: 
+    #     p_original_text.append(perturb_texts_vllm(x, span_length=span_length, pct=args.pct_words_masked)[0]) 
+
+    perturb_fn = functools.partial(perturb_texts_vllm, span_length=span_length, pct=args.pct_words_masked)
     p_sampled_text = perturb_fn([x for x in sampled_text for _ in range(n_perturbations)])
     p_original_text = perturb_fn([x for x in original_text for _ in range(n_perturbations)])
     for _ in range(n_perturbation_rounds - 1):
@@ -449,13 +704,14 @@ def get_perturbation_results(span_length=10, n_perturbations=1, n_samples=500):
             "perturbed_original": p_original_text[idx * n_perturbations: (idx + 1) * n_perturbations]
         })
 
-    load_base_model()
+    # TODO: See why this loads the base model at this point. 
+    # load_base_model()
 
     for res in tqdm.tqdm(results, desc="Computing log likelihoods"):
-        p_sampled_ll = get_lls(res["perturbed_sampled"])
-        p_original_ll = get_lls(res["perturbed_original"])
-        res["original_ll"] = get_ll(res["original"])
-        res["sampled_ll"] = get_ll(res["sampled"])
+        p_sampled_ll = get_lls_vllm(res["perturbed_sampled"])
+        p_original_ll = get_lls_vllm(res["perturbed_original"])
+        res["original_ll"] = get_ll_vllm(res["original"])
+        res["sampled_ll"] = get_ll_vllm(res["sampled"])
         res["all_perturbed_sampled_ll"] = p_sampled_ll
         res["all_perturbed_original_ll"] = p_original_ll
         res["perturbed_sampled_ll"] = np.mean(p_sampled_ll)
@@ -515,24 +771,85 @@ def run_perturbation_experiment(results, criterion, span_length=10, n_perturbati
     }
 
 
-def run_baseline_threshold_experiment(data, criterion_fn, name, n_samples=500):
+# def run_baseline_threshold_experiment(data, criterion_fn, name, n_samples=500):
+#     torch.manual_seed(0)
+#     np.random.seed(0)
+
+#     ic(data)
+
+#     results = []
+#     for batch in tqdm.tqdm(range(n_samples // batch_size), desc=f"Computing {name} criterion"):
+#         original_text = data["original"][batch * batch_size:(batch + 1) * batch_size]
+#         sampled_text = data["sampled"][batch * batch_size:(batch + 1) * batch_size]
+
+#         for idx in range(len(original_text)):
+#             results.append({
+#                 "original": original_text[idx],
+#                 "original_crit": criterion_fn(original_text[idx]),
+#                 "sampled": sampled_text[idx],
+#                 "sampled_crit": criterion_fn(sampled_text[idx]),
+#             })
+
+#     # compute prediction scores for real/sampled passages
+#     predictions = {
+#         'real': [x["original_crit"] for x in results],
+#         'samples': [x["sampled_crit"] for x in results],
+#     }
+
+#     fpr, tpr, roc_auc = get_roc_metrics(predictions['real'], predictions['samples'])
+#     p, r, pr_auc = get_precision_recall_metrics(predictions['real'], predictions['samples'])
+#     print(f"{name}_threshold ROC AUC: {roc_auc}, PR AUC: {pr_auc}")
+#     return {
+#         'name': f'{name}_threshold',
+#         'predictions': predictions,
+#         'info': {
+#             'n_samples': n_samples,
+#         },
+#         'raw_results': results,
+#         'metrics': {
+#             'roc_auc': roc_auc,
+#             'fpr': fpr,
+#             'tpr': tpr,
+#         },
+#         'pr_metrics': {
+#             'pr_auc': pr_auc,
+#             'precision': p,
+#             'recall': r,
+#         },
+#         'loss': 1 - pr_auc,
+#     }
+
+
+
+def run_baseline_threshold_experiment_vllm(data, criterion_fn, name, n_samples=500):
     torch.manual_seed(0)
     np.random.seed(0)
 
     ic(data)
 
     results = []
-    for batch in tqdm.tqdm(range(n_samples // batch_size), desc=f"Computing {name} criterion"):
-        original_text = data["original"][batch * batch_size:(batch + 1) * batch_size]
-        sampled_text = data["sampled"][batch * batch_size:(batch + 1) * batch_size]
+    # for batch in tqdm.tqdm(range(n_samples // batch_size), desc=f"Computing {name} criterion"):
+    #     original_text = data["original"][batch * batch_size:(batch + 1) * batch_size]
+    #     sampled_text = data["sampled"][batch * batch_size:(batch + 1) * batch_size]
 
-        for idx in range(len(original_text)):
-            results.append({
-                "original": original_text[idx],
-                "original_crit": criterion_fn(original_text[idx]),
-                "sampled": sampled_text[idx],
-                "sampled_crit": criterion_fn(sampled_text[idx]),
-            })
+    #     for idx in range(len(original_text)):
+    #         results.append({
+    #             "original": original_text[idx],
+    #             "original_crit": criterion_fn(original_text[idx]),
+    #             "sampled": sampled_text[idx],
+    #             "sampled_crit": criterion_fn(sampled_text[idx]),
+    #         })
+
+    original_text = data["original"] 
+    sampled_text = data["sampled"]
+    for i in range(len(data["original"])): 
+        results.append({
+            "original": original_text[i],
+            "original_crit": criterion_fn(original_text[i]),
+            "sampled": sampled_text[i],
+            "sampled_crit": criterion_fn(sampled_text[i]),
+        })
+
 
     # compute prediction scores for real/sampled passages
     predictions = {
@@ -589,7 +906,46 @@ def truncate_to_substring(text, substring, idx_occurrence):
     return text[:idx]
 
 
-def generate_samples(raw_data, batch_size):
+# def generate_samples(raw_data, batch_size):
+#     torch.manual_seed(42)
+#     np.random.seed(42)
+#     data = {
+#         "original": [],
+#         "sampled": [],
+#     }
+
+#     ic(type(raw_data))
+
+#     for batch in range(len(raw_data) // batch_size):
+#         print('Generating samples for batch', batch, 'of', len(raw_data) // batch_size)
+#         original_text = raw_data[batch * batch_size:(batch + 1) * batch_size]
+#         sampled_text = sample_from_model(original_text, min_words=30 if args.dataset in ['pubmed'] else 55)
+
+#         for o, s in zip(original_text, sampled_text):
+#             if args.dataset == 'pubmed':
+#                 s = truncate_to_substring(s, 'Question:', 2)
+#                 o = o.replace(custom_datasets.SEPARATOR, ' ')
+
+#             o, s = trim_to_shorter_length(o, s)
+
+#             # add to the data
+#             data["original"].append(o)
+#             data["sampled"].append(s)
+    
+#     if args.pre_perturb_pct > 0:
+#         print(f'APPLYING {args.pre_perturb_pct}, {args.pre_perturb_span_length} PRE-PERTURBATIONS')
+#         load_mask_model()
+#         data["sampled"] = perturb_texts(data["sampled"], args.pre_perturb_span_length, args.pre_perturb_pct, ceil_pct=True)
+#         load_base_model()
+
+#     ic(len(data["original"]), len(data["sampled"]))
+
+#     return data
+
+
+# TODO: Split this into 2 functions: 1 for generating the data (upto pre_perturb_act > 0)
+# and another for applying pre perturbations 
+def generate_samples_vllm(raw_data):
     torch.manual_seed(42)
     np.random.seed(42)
     data = {
@@ -599,27 +955,30 @@ def generate_samples(raw_data, batch_size):
 
     ic(type(raw_data))
 
-    for batch in range(len(raw_data) // batch_size):
-        print('Generating samples for batch', batch, 'of', len(raw_data) // batch_size)
-        original_text = raw_data[batch * batch_size:(batch + 1) * batch_size]
-        sampled_text = sample_from_model(original_text, min_words=30 if args.dataset in ['pubmed'] else 55)
+    print('Generating samples')
+    original_text = raw_data
+    sampled_text = sample_from_model(original_text, min_words=30 if args.dataset in ['pubmed'] else 55)
 
-        for o, s in zip(original_text, sampled_text):
-            if args.dataset == 'pubmed':
-                s = truncate_to_substring(s, 'Question:', 2)
-                o = o.replace(custom_datasets.SEPARATOR, ' ')
+    for o, s in zip(original_text, sampled_text):
+        if args.dataset == 'pubmed':
+            s = truncate_to_substring(s, 'Question:', 2)
+            o = o.replace(custom_datasets.SEPARATOR, ' ')
 
-            o, s = trim_to_shorter_length(o, s)
+        o, s = trim_to_shorter_length(o, s)
 
-            # add to the data
-            data["original"].append(o)
-            data["sampled"].append(s)
-    
+        # add to the data
+        data["original"].append(o)
+        data["sampled"].append(s)
+
+    return data 
+
+
+def apply_pre_perturbations(data: Dict[str, List[str]]): 
     if args.pre_perturb_pct > 0:
         print(f'APPLYING {args.pre_perturb_pct}, {args.pre_perturb_span_length} PRE-PERTURBATIONS')
-        load_mask_model()
-        data["sampled"] = perturb_texts(data["sampled"], args.pre_perturb_span_length, args.pre_perturb_pct, ceil_pct=True)
-        load_base_model()
+        # load_mask_model()
+        data["sampled"] = perturb_texts_vllm(data["sampled"], args.pre_perturb_span_length, args.pre_perturb_pct, ceil_pct=True)
+        # load_base_model()
 
     ic(len(data["original"]), len(data["sampled"]))
 
@@ -660,14 +1019,18 @@ def generate_data(dataset, key):
 
     # keep only examples with <= 512 tokens according to mask_tokenizer
     # this step has the extra effect of removing examples with low-quality/garbage content
-    tokenized_data = preproc_tokenizer(data)
-    data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= 512]
+    # tokenized_data = preproc_tokenizer(data)
+    # data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= 512]
 
     # print stats about remainining data
     print(f"Total number of samples: {len(data)}")
     print(f"Average number of words: {np.mean([len(x.split()) for x in data])}")
 
-    return generate_samples(data[:n_samples], batch_size=batch_size)
+    # return generate_samples(data[:n_samples])
+    # samples = generate_samples_vllm(data[:n_samples]) 
+    # samples = apply_pre_perturbations(samples) 
+
+    return generate_samples_vllm(data[:n_samples])
 
 
 def load_base_model_and_tokenizer(name):
@@ -694,27 +1057,87 @@ def load_base_model_and_tokenizer(name):
     return base_model, base_tokenizer
 
 
-def eval_supervised(data, model):
+# def eval_supervised(data, model):
+#     print(f'Beginning supervised evaluation with {model}...')
+#     detector = transformers.AutoModelForSequenceClassification.from_pretrained(model, cache_dir=cache_dir).to(DEVICE)
+#     tokenizer = transformers.AutoTokenizer.from_pretrained(model, cache_dir=cache_dir)
+
+#     real, fake = data['original'], data['sampled']
+
+#     with torch.no_grad():
+#         # get predictions for real
+#         real_preds = []
+#         for batch in tqdm.tqdm(range(len(real) // batch_size), desc="Evaluating real"):
+#             batch_real = real[batch * batch_size:(batch + 1) * batch_size]
+#             batch_real = tokenizer(batch_real, padding=True, truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
+#             real_preds.extend(detector(**batch_real).logits.softmax(-1)[:,0].tolist())
+        
+#         # get predictions for fake
+#         fake_preds = []
+#         for batch in tqdm.tqdm(range(len(fake) // batch_size), desc="Evaluating fake"):
+#             batch_fake = fake[batch * batch_size:(batch + 1) * batch_size]
+#             batch_fake = tokenizer(batch_fake, padding=True, truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
+#             fake_preds.extend(detector(**batch_fake).logits.softmax(-1)[:,0].tolist())
+
+#     predictions = {
+#         'real': real_preds,
+#         'samples': fake_preds,
+#     }
+
+#     fpr, tpr, roc_auc = get_roc_metrics(real_preds, fake_preds)
+#     p, r, pr_auc = get_precision_recall_metrics(real_preds, fake_preds)
+#     print(f"{model} ROC AUC: {roc_auc}, PR AUC: {pr_auc}")
+
+#     # free GPU memory
+#     del detector
+#     torch.cuda.empty_cache()
+
+#     return {
+#         'name': model,
+#         'predictions': predictions,
+#         'info': {
+#             'n_samples': n_samples,
+#         },
+#         'metrics': {
+#             'roc_auc': roc_auc,
+#             'fpr': fpr,
+#             'tpr': tpr,
+#         },
+#         'pr_metrics': {
+#             'pr_auc': pr_auc,
+#             'precision': p,
+#             'recall': r,
+#         },
+#         'loss': 1 - pr_auc,
+#     }
+
+
+def eval_supervised_vllm(data, model):
     print(f'Beginning supervised evaluation with {model}...')
-    detector = transformers.AutoModelForSequenceClassification.from_pretrained(model, cache_dir=cache_dir).to(DEVICE)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model, cache_dir=cache_dir)
+    # TODO: convert model to vLLM 
+    # detector = transformers.AutoModelForSequenceClassification.from_pretrained(model, cache_dir=cache_dir).to(DEVICE)
+    # tokenizer = transformers.AutoTokenizer.from_pretrained(model, cache_dir=cache_dir)
 
     real, fake = data['original'], data['sampled']
 
-    with torch.no_grad():
-        # get predictions for real
-        real_preds = []
-        for batch in tqdm.tqdm(range(len(real) // batch_size), desc="Evaluating real"):
-            batch_real = real[batch * batch_size:(batch + 1) * batch_size]
-            batch_real = tokenizer(batch_real, padding=True, truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
-            real_preds.extend(detector(**batch_real).logits.softmax(-1)[:,0].tolist())
+    real_preds = detector.generate(real, sampling_params) 
+    fake_preds = detector.generate(fake, sampling_params) 
+
+
+    # with torch.no_grad():
+    #     # get predictions for real
+    #     real_preds = []
+    #     for batch in tqdm.tqdm(range(len(real) // batch_size), desc="Evaluating real"):
+    #         batch_real = real[batch * batch_size:(batch + 1) * batch_size]
+    #         batch_real = tokenizer(batch_real, padding=True, truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
+    #         real_preds.extend(detector(**batch_real).logits.softmax(-1)[:,0].tolist())
         
-        # get predictions for fake
-        fake_preds = []
-        for batch in tqdm.tqdm(range(len(fake) // batch_size), desc="Evaluating fake"):
-            batch_fake = fake[batch * batch_size:(batch + 1) * batch_size]
-            batch_fake = tokenizer(batch_fake, padding=True, truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
-            fake_preds.extend(detector(**batch_fake).logits.softmax(-1)[:,0].tolist())
+    #     # get predictions for fake
+    #     fake_preds = []
+    #     for batch in tqdm.tqdm(range(len(fake) // batch_size), desc="Evaluating fake"):
+    #         batch_fake = fake[batch * batch_size:(batch + 1) * batch_size]
+    #         batch_fake = tokenizer(batch_fake, padding=True, truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
+    #         fake_preds.extend(detector(**batch_fake).logits.softmax(-1)[:,0].tolist())
 
     predictions = {
         'real': real_preds,
@@ -778,6 +1201,7 @@ if __name__ == '__main__':
     parser.add_argument('--openai_key', type=str)
     parser.add_argument('--baselines_only', action='store_true')
     parser.add_argument('--skip_baselines', action='store_true')
+    parser.add_argument('--use_vllm', action='store_true')
     parser.add_argument('--buffer_size', type=int, default=1)
     parser.add_argument('--mask_top_p', type=float, default=1.0)
     parser.add_argument('--pre_perturb_pct', type=float, default=0.0)
@@ -833,23 +1257,51 @@ if __name__ == '__main__':
 
     # generic generative model
     base_model, base_tokenizer = load_base_model_and_tokenizer(args.base_model_name)
+    vllm_client = None 
+    if args.use_vllm and args.openai_model is None:
+        print(f'Loading VLLM BASE model {args.base_model_name}...')
+        base_model = LLM(args.base_model_name) 
 
     # mask filling t5 model
-    if not args.baselines_only and not args.random_fills:
-        int8_kwargs = {}
-        half_kwargs = {}
-        if args.int8:
-            int8_kwargs = dict(load_in_8bit=True, device_map='auto', torch_dtype=torch.bfloat16)
-        elif args.half:
-            half_kwargs = dict(torch_dtype=torch.bfloat16)
-        print(f'Loading mask filling model {mask_filling_model_name}...')
-        mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(mask_filling_model_name, **int8_kwargs, **half_kwargs, cache_dir=cache_dir)
-        try:
-            n_positions = mask_model.config.n_positions
-        except AttributeError:
-            n_positions = 512
-    else:
-        n_positions = 512
+    # if not args.baselines_only and not args.random_fills:
+    #     int8_kwargs = {}
+    #     half_kwargs = {}
+    #     if args.int8:
+    #         int8_kwargs = dict(load_in_8bit=True, device_map='auto', torch_dtype=torch.bfloat16)
+    #     elif args.half:
+    #         half_kwargs = dict(torch_dtype=torch.bfloat16)
+    #     print(f'Loading mask filling model {mask_filling_model_name}...')
+    #     mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(mask_filling_model_name, **int8_kwargs, **half_kwargs, cache_dir=cache_dir)
+    #     try:
+    #         n_positions = mask_model.config.n_positions
+    #     except AttributeError:
+    #         n_positions = 512
+    # else:
+    #     n_positions = 512
+
+    # if not args.baselines_only and not args.random_fills:
+    #     if args.use_vllm and args.openai_model is None:
+    #         print(f'Loading VLLM MASK-FILL model {mask_filling_model_name}...')
+    #         vllm_mask_client = LLM(model=mask_filling_model_name)
+    #         mask_model = None
+    #         n_positions = 512
+    #     else:
+    #         int8_kwargs = {}
+    #         half_kwargs = {}
+    #         if args.int8:
+    #             int8_kwargs = dict(load_in_8bit=True, device_map='auto', torch_dtype=torch.bfloat16)
+    #         elif args.half:
+    #             half_kwargs = dict(torch_dtype=torch.bfloat16)
+    #         print(f'Loading mask filling model {mask_filling_model_name}...')
+    #         mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(mask_filling_model_name, **int8_kwargs, **half_kwargs, cache_dir=cache_dir)
+    #         try:
+    #             n_positions = mask_model.config.n_positions
+    #         except AttributeError:
+    #             n_positions = 512
+    # else:
+    #     n_positions = 512
+
+    vllm_mask_model = LLM(mask_filling_model_name)
     preproc_tokenizer = transformers.AutoTokenizer.from_pretrained('t5-small', model_max_length=512, cache_dir=cache_dir)
     mask_tokenizer = transformers.AutoTokenizer.from_pretrained(mask_filling_model_name, model_max_length=n_positions, cache_dir=cache_dir)
     if args.dataset in ['english', 'german']:
@@ -859,6 +1311,7 @@ if __name__ == '__main__':
 
     print(f'Loading dataset {args.dataset}...')
     data = generate_data(args.dataset, args.dataset_key)
+    data = apply_pre_perturbations(data) 
     if args.random_fills:
         FILL_DICTIONARY = set()
         for texts in data.values():
@@ -866,13 +1319,14 @@ if __name__ == '__main__':
                 FILL_DICTIONARY.update(text.split())
         FILL_DICTIONARY = sorted(list(FILL_DICTIONARY))
 
-    if args.scoring_model_name:
-        print(f'Loading SCORING model {args.scoring_model_name}...')
-        del base_model
-        del base_tokenizer
-        torch.cuda.empty_cache()
-        base_model, base_tokenizer = load_base_model_and_tokenizer(args.scoring_model_name)
-        load_base_model()  # Load again because we've deleted/replaced the old model
+    # TODO: Fix this logic for loading a different scoring model as the base model 
+    # if args.scoring_model_name:
+    #     print(f'Loading SCORING model {args.scoring_model_name}...')
+    #     del base_model
+    #     del base_tokenizer
+    #     torch.cuda.empty_cache()
+    #     base_model, base_tokenizer = load_base_model_and_tokenizer(args.scoring_model_name)
+    #     load_base_model()  # Load again because we've deleted/replaced the old model
 
     # write the data to a json file in the save folder
     with open(os.path.join(SAVE_FOLDER, "raw_data.json"), "w") as f:
@@ -880,24 +1334,27 @@ if __name__ == '__main__':
         json.dump(data, f)
 
     if not args.skip_baselines:
-        baseline_outputs = [run_baseline_threshold_experiment(data, get_ll, "likelihood", n_samples=n_samples)]
+        baseline_outputs = [run_baseline_threshold_experiment_vllm(data, get_ll_vllm, "likelihood", n_samples=n_samples)]
         if args.openai_model is None:
-            rank_criterion = lambda text: -get_rank(text, log=False)
-            baseline_outputs.append(run_baseline_threshold_experiment(rank_criterion, "rank", n_samples=n_samples))
-            logrank_criterion = lambda text: -get_rank(text, log=True)
-            baseline_outputs.append(run_baseline_threshold_experiment(logrank_criterion, "log_rank", n_samples=n_samples))
-            entropy_criterion = lambda text: get_entropy(text)
-            baseline_outputs.append(run_baseline_threshold_experiment(entropy_criterion, "entropy", n_samples=n_samples))
+            # TODO: Change to use original text and not sampled text from `data` instead of `text`
+            rank_criterion = lambda text: -get_rank_vllm(text, log=False)
+            baseline_outputs.append(run_baseline_threshold_experiment_vllm(data, rank_criterion, "rank", n_samples=n_samples))
+            # TODO: Change to use original text and not sampled text from `data` instead of `text`
+            logrank_criterion = lambda text: -get_rank_vllm(text, log=True)
+            baseline_outputs.append(run_baseline_threshold_experiment_vllm(data, logrank_criterion, "log_rank", n_samples=n_samples))
+            # TODO: Change to use original text and not sampled text from `data` instead of `text`
+            entropy_criterion = lambda text: get_entropy_vllm(text)
+            baseline_outputs.append(run_baseline_threshold_experiment_vllm(data, entropy_criterion, "entropy", n_samples=n_samples))
 
-        baseline_outputs.append(eval_supervised(data, model='roberta-base-openai-detector'))
-        baseline_outputs.append(eval_supervised(data, model='roberta-large-openai-detector'))
+        baseline_outputs.append(eval_supervised_vllm(data, model='roberta-base-openai-detector'))
+        baseline_outputs.append(eval_supervised_vllm(data, model='roberta-large-openai-detector'))
 
     outputs = []
 
     if not args.baselines_only:
         # run perturbation experiments
         for n_perturbations in n_perturbation_list:
-            perturbation_results = get_perturbation_results(args.span_length, n_perturbations, n_samples)
+            perturbation_results = get_perturbation_results_vllm(args.span_length, n_perturbations, n_samples)
             for perturbation_mode in ['d', 'z']:
                 output = run_perturbation_experiment(
                     perturbation_results, perturbation_mode, span_length=args.span_length, n_perturbations=n_perturbations, n_samples=n_samples)
