@@ -45,20 +45,20 @@ pattern = re.compile(r"<extra_id_\d+>")
 
 
 
-def load_mask_model():
-    print('MOVING MASK MODEL TO GPU...', end='', flush=True)
-    start = time.time()
+# def load_mask_model():
+#     print('MOVING MASK MODEL TO GPU...', end='', flush=True)
+#     start = time.time()
 
-    if args.openai_model is None:
-        base_model.cpu()
-    if not args.random_fills:
-    #     mask_model.to(DEVICE)
-        try: 
-            if mask_model is not None: 
-                mask_model.to(DEVICE)
-        except Exception: 
-            pass 
-    print(f'DONE ({time.time() - start:.2f}s)')
+#     if args.openai_model is None:
+#         base_model.cpu()
+#     if not args.random_fills:
+#     #     mask_model.to(DEVICE)
+#         try: 
+#             if mask_model is not None: 
+#                 mask_model.to(DEVICE)
+#         except Exception: 
+#             pass 
+#     print(f'DONE ({time.time() - start:.2f}s)')
 
 
 def tokenize_and_mask(text, span_length, pct, ceil_pct=False):
@@ -316,22 +316,17 @@ def _openai_sample(p):
 # sample from base_model using ****only**** the first 30 tokens in each example as context
 def sample_from_model(texts: List[str], min_words: int = 55, prompt_tokens: int = 30):
     # encode each text as a list of token ids
-    if args.dataset == 'pubmed':
-        texts = [t[:t.index(custom_datasets.SEPARATOR)] for t in texts]
-        all_encoded = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
-    else:
-        all_encoded = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
-        all_encoded = {key: value[:, :prompt_tokens] for key, value in all_encoded.items()}
+    # if args.dataset == 'pubmed':
+    #     texts = [t[:t.index(custom_datasets.SEPARATOR)] for t in texts]
+    #     all_encoded = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
+    # else:
+    #     all_encoded = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
+    #     all_encoded = {key: value[:, :prompt_tokens] for key, value in all_encoded.items()}
 
     if args.openai_model:
-        # decode the prefixes back into text
-        prefixes = base_tokenizer.batch_decode(all_encoded['input_ids'], skip_special_tokens=True)
         pool = ThreadPool(args.batch_size)
-
-        decoded = pool.map(_openai_sample, prefixes)
-        return decoded 
-
-    if args.use_vllm and vllm_client is not None:
+        decoded = pool.map(_openai_sample, texts)
+    elif args.use_vllm and generation_model is not None:
         sampling_params = SamplingParams(
             temperature=1.0, 
             top_p=args.top_p if args.do_top_p else 1.0,
@@ -339,29 +334,30 @@ def sample_from_model(texts: List[str], min_words: int = 55, prompt_tokens: int 
             logprobs=1
         )
 
-        decoded = vllm_client.generate(texts, sampling_params=sampling_params, min_tokens=min_words, max_tokens=200)
-        return decoded
+        decoded = generation_model.generate(texts, sampling_params=sampling_params, min_tokens=min_words, max_tokens=200)
+    
+    return decoded
         
-    else:
-        decoded = ['' for _ in range(len(texts))]
+    # else:
+    #     decoded = ['' for _ in range(len(texts))]
 
-        # sample from the model until we get a sample with at least min_words words for each example
-        # this is an inefficient way to do this (since we regenerate for all inputs if just one is too short), but it works
-        tries = 0
-        while (m := min(len(x.split()) for x in decoded)) < min_words:
-            if tries != 0:
-                print()
-                print(f"min words: {m}, needed {min_words}, regenerating (try {tries})")
+    #     # sample from the model until we get a sample with at least min_words words for each example
+    #     # this is an inefficient way to do this (since we regenerate for all inputs if just one is too short), but it works
+    #     tries = 0
+    #     while (m := min(len(x.split()) for x in decoded)) < min_words:
+    #         if tries != 0:
+    #             print()
+    #             print(f"min words: {m}, needed {min_words}, regenerating (try {tries})")
 
-            sampling_kwargs = {}
-            if args.do_top_p:
-                sampling_kwargs['top_p'] = args.top_p
-            elif args.do_top_k:
-                sampling_kwargs['top_k'] = args.top_k
-            min_length = 50 if args.dataset in ['pubmed'] else 150
-            outputs = base_model.generate(**all_encoded, min_length=min_length, max_length=200, do_sample=True, **sampling_kwargs, pad_token_id=base_tokenizer.eos_token_id, eos_token_id=base_tokenizer.eos_token_id)
-            decoded = base_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            tries += 1
+    #         sampling_kwargs = {}
+    #         if args.do_top_p:
+    #             sampling_kwargs['top_p'] = args.top_p
+    #         elif args.do_top_k:
+    #             sampling_kwargs['top_k'] = args.top_k
+    #         min_length = 50 if args.dataset in ['pubmed'] else 150
+    #         outputs = base_model.generate(**all_encoded, min_length=min_length, max_length=200, do_sample=True, **sampling_kwargs, pad_token_id=base_tokenizer.eos_token_id, eos_token_id=base_tokenizer.eos_token_id)
+    #         decoded = base_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    #         tries += 1
 
     # if args.openai_model:
     #     global API_TOKEN_COUNTER
@@ -370,7 +366,7 @@ def sample_from_model(texts: List[str], min_words: int = 55, prompt_tokens: int 
     #     total_tokens = sum(len(GPT2_TOKENIZER.encode(x)) for x in decoded)
     #     API_TOKEN_COUNTER += total_tokens
 
-    return decoded
+    # return decoded
 
 
 # def get_likelihood(logits, labels):
@@ -405,24 +401,10 @@ def get_likelihood(outputs):
 #             return -base_model(**tokenized, labels=labels).loss.item()
 
 # Get the log likelihood of each text under the base_model
-# TODO: refactor to use vllm outputs correctly 
+# This function must accept a list of vllm CompletionOutputs for vllm models 
+
 def get_ll_vllm(data):
-    return [d.outputs[0].logprobs for d in data]
-    # if args.openai_model:        
-    #     kwargs = { "engine": args.openai_model, "temperature": 0, "max_tokens": 0, "echo": True, "logprobs": 0}
-    #     r = openai.Completion.create(prompt=f"<|endoftext|>{text}", **kwargs)
-    #     result = r['choices'][0]
-    #     tokens, logprobs = result["logprobs"]["tokens"][1:], result["logprobs"]["token_logprobs"][1:]
-
-    #     assert len(tokens) == len(logprobs), f"Expected {len(tokens)} logprobs, got {len(logprobs)}"
-
-    #     return np.mean(logprobs)
-    # else:
-        # with torch.no_grad():
-        #     tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
-        #     labels = tokenized.input_ids
-        #     return -base_model(**tokenized, labels=labels).loss.item()
-
+        return [d.outputs[0].cumulative_logprob / len(d.outputs[0].token_ids) for d in data][0]
 
 # def get_lls(texts):
 #     if not args.openai_model:
@@ -438,19 +420,9 @@ def get_ll_vllm(data):
 #         return pool.map(get_ll, texts)
 
 
-
+# This function must accept a list of RequestOutputs for vllm models 
 def get_lls_vllm(texts):
-    if not args.openai_model:
-        return [get_ll_vllm(text) for text in texts]
-    else:
-        global API_TOKEN_COUNTER
-
-        # use GPT2_TOKENIZER to get total number of tokens
-        total_tokens = sum(len(GPT2_TOKENIZER.encode(text)) for text in texts)
-        API_TOKEN_COUNTER += total_tokens * 2  # multiply by two because OpenAI double-counts echo_prompt tokens
-
-        pool = ThreadPool(args.batch_size)
-        return pool.map(get_ll_vllm, texts)
+    return [get_ll_vllm(text) for text in texts]    
 
 
 # get the average rank of each observed token sorted by model likelihood
@@ -478,10 +450,11 @@ def get_lls_vllm(texts):
 
 #         return ranks.float().mean().item()
 
+# TODO: get rank
 def get_rank_vllm(data, log=False):
     assert args.openai_model is None, "get_rank not implemented for OpenAI models"
 
-    ranks = [d.outputs[0].rank for d in data]
+    ranks = [d.outputs[0].logprobs for d in data]
     ranks = torch.tensor(ranks, dtype=torch.float32)
     ranks = ranks + 1 
     if log: 
@@ -521,15 +494,15 @@ def get_rank_vllm(data, log=False):
 #         neg_entropy = F.softmax(logits, dim=-1) * F.log_softmax(logits, dim=-1)
 #         return -neg_entropy.sum(-1).mean().item()
 
-# TODO: Implement get_entropy_vllm 
 def get_entropy_vllm(text):
-    assert args.openai_model is None, "get_entropy not implemented for OpenAI models"
+    raise ValueError("get entropy not implemented for vLLM models")
+    # assert args.openai_model is None, "get_entropy not implemented for OpenAI models"
 
-    with torch.no_grad():
-        tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
-        logits = base_model(**tokenized).logits[:,:-1]
-        neg_entropy = F.softmax(logits, dim=-1) * F.log_softmax(logits, dim=-1)
-        return -neg_entropy.sum(-1).mean().item()
+    # with torch.no_grad():
+    #     tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
+    #     logits = base_model(**tokenized).logits[:,:-1]
+    #     neg_entropy = F.softmax(logits, dim=-1) * F.log_softmax(logits, dim=-1)
+    #     return -neg_entropy.sum(-1).mean().item()
 
 
 def get_roc_metrics(real_preds, sample_preds):
@@ -942,9 +915,6 @@ def truncate_to_substring(text, substring, idx_occurrence):
 
 #     return data
 
-
-# TODO: Split this into 2 functions: 1 for generating the data (upto pre_perturb_act > 0)
-# and another for applying pre perturbations 
 def generate_samples_vllm(raw_data):
     torch.manual_seed(42)
     np.random.seed(42)
@@ -976,16 +946,63 @@ def generate_samples_vllm(raw_data):
 def apply_pre_perturbations(data: Dict[str, List[str]]): 
     if args.pre_perturb_pct > 0:
         print(f'APPLYING {args.pre_perturb_pct}, {args.pre_perturb_span_length} PRE-PERTURBATIONS')
-        # load_mask_model()
         data["sampled"] = perturb_texts_vllm(data["sampled"], args.pre_perturb_span_length, args.pre_perturb_pct, ceil_pct=True)
-        # load_base_model()
 
     ic(len(data["original"]), len(data["sampled"]))
 
     return data
 
 
-def generate_data(dataset, key):
+# def generate_data(dataset, key):
+#     # load data
+#     if dataset in custom_datasets.DATASETS:
+#         data = custom_datasets.load(dataset, cache_dir)
+#     else:
+#         data = datasets.load_dataset(dataset, split='train', cache_dir=cache_dir, trust_remote_code=True)[key]
+
+#     # get unique examples, strip whitespace, and remove newlines
+#     # then take just the long examples, shuffle, take the first 5,000 to tokenize to save time
+#     # then take just the examples that are <= 512 tokens (for the mask model)
+#     # then generate n_samples samples
+
+#     # remove duplicates from the data
+#     data = list(dict.fromkeys(data))  # deterministic, as opposed to set()
+
+#     # strip whitespace around each example
+#     data = [x.strip() for x in data]
+
+#     # remove newlines from each example
+#     data = [strip_newlines(x) for x in data]
+
+#     # try to keep only examples with > 250 words
+#     if dataset in ['writing', 'squad', 'xsum']:
+#         long_data = [x for x in data if len(x.split()) > 250]
+#         if len(long_data) > 0:
+#             data = long_data
+
+#     random.seed(0)
+#     random.shuffle(data)
+
+#     data = data[:5_000]
+
+#     # keep only examples with <= 512 tokens according to mask_tokenizer
+#     # this step has the extra effect of removing examples with low-quality/garbage content
+#     # tokenized_data = preproc_tokenizer(data)
+#     # data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= 512]
+
+#     # print stats about remainining data
+#     print(f"Total number of samples: {len(data)}")
+#     print(f"Average number of words: {np.mean([len(x.split()) for x in data])}")
+
+#     # return generate_samples(data[:n_samples])
+#     # samples = generate_samples_vllm(data[:n_samples]) 
+#     # samples = apply_pre_perturbations(samples) 
+
+#     return generate_samples_vllm(data[:n_samples])
+
+
+
+def generate_data_vllm(dataset, key):
     # load data
     if dataset in custom_datasets.DATASETS:
         data = custom_datasets.load(dataset, cache_dir)
@@ -1026,24 +1043,20 @@ def generate_data(dataset, key):
     print(f"Total number of samples: {len(data)}")
     print(f"Average number of words: {np.mean([len(x.split()) for x in data])}")
 
-    # return generate_samples(data[:n_samples])
-    # samples = generate_samples_vllm(data[:n_samples]) 
-    # samples = apply_pre_perturbations(samples) 
-
     return generate_samples_vllm(data[:n_samples])
 
 
-def load_base_model_and_tokenizer(name):
-    if args.openai_model is None:
-        print(f'Loading BASE model {args.base_model_name}...')
-        base_model_kwargs = {}
-        if 'gpt-j' in name or 'neox' in name:
-            base_model_kwargs.update(dict(torch_dtype=torch.float16))
-        if 'gpt-j' in name:
-            base_model_kwargs.update(dict(revision='float16'))
-        base_model = transformers.AutoModelForCausalLM.from_pretrained(name, **base_model_kwargs, cache_dir=cache_dir)
-    else:
-        base_model = None
+def load_tokenizer(name):
+    # if args.openai_model is None:
+    #     print(f'Loading BASE model {args.base_model_name}...')
+    #     base_model_kwargs = {}
+    #     if 'gpt-j' in name or 'neox' in name:
+    #         base_model_kwargs.update(dict(torch_dtype=torch.float16))
+    #     if 'gpt-j' in name:
+    #         base_model_kwargs.update(dict(revision='float16'))
+    #     base_model = transformers.AutoModelForCausalLM.from_pretrained(name, **base_model_kwargs, cache_dir=cache_dir)
+    # else:
+    #     base_model = None
 
     optional_tok_kwargs = {}
     if "facebook/opt-" in name:
@@ -1054,7 +1067,7 @@ def load_base_model_and_tokenizer(name):
     base_tokenizer = transformers.AutoTokenizer.from_pretrained(name, **optional_tok_kwargs, cache_dir=cache_dir)
     base_tokenizer.pad_token_id = base_tokenizer.eos_token_id
 
-    return base_model, base_tokenizer
+    return base_tokenizer
 
 
 # def eval_supervised(data, model):
@@ -1256,11 +1269,12 @@ if __name__ == '__main__':
     GPT2_TOKENIZER = transformers.GPT2Tokenizer.from_pretrained('gpt2', cache_dir=cache_dir)
 
     # generic generative model
-    base_model, base_tokenizer = load_base_model_and_tokenizer(args.base_model_name)
-    vllm_client = None 
+    # base_model, base_tokenizer = load_base_model_and_tokenizer(args.base_model_name)
+    base_tokenizer = load_tokenizer(args.base_model_name)
+    generation_model = None 
     if args.use_vllm and args.openai_model is None:
         print(f'Loading VLLM BASE model {args.base_model_name}...')
-        base_model = LLM(args.base_model_name) 
+        generation_model = LLM(args.base_model_name) 
 
     # mask filling t5 model
     # if not args.baselines_only and not args.random_fills:
@@ -1301,23 +1315,28 @@ if __name__ == '__main__':
     # else:
     #     n_positions = 512
 
-    vllm_mask_model = LLM(mask_filling_model_name)
-    preproc_tokenizer = transformers.AutoTokenizer.from_pretrained('t5-small', model_max_length=512, cache_dir=cache_dir)
-    mask_tokenizer = transformers.AutoTokenizer.from_pretrained(mask_filling_model_name, model_max_length=n_positions, cache_dir=cache_dir)
-    if args.dataset in ['english', 'german']:
-        preproc_tokenizer = mask_tokenizer
 
-    load_base_model()
 
     print(f'Loading dataset {args.dataset}...')
-    data = generate_data(args.dataset, args.dataset_key)
+    data = generate_data_vllm(args.dataset, args.dataset_key) 
+    del generation_model
+
+    
+    mask_model = LLM(mask_filling_model_name)
+    # n_positions = 512 
+    # preproc_tokenizer = transformers.AutoTokenizer.from_pretrained('t5-small', model_max_length=512, cache_dir=cache_dir)
+    # mask_tokenizer = transformers.AutoTokenizer.from_pretrained(mask_filling_model_name, model_max_length=n_positions, cache_dir=cache_dir)
+    # if args.dataset in ['english', 'german']:
+    #     preproc_tokenizer = mask_tokenizer
     data = apply_pre_perturbations(data) 
+    
     if args.random_fills:
         FILL_DICTIONARY = set()
         for texts in data.values():
             for text in texts:
                 FILL_DICTIONARY.update(text.split())
         FILL_DICTIONARY = sorted(list(FILL_DICTIONARY))
+
 
     # TODO: Fix this logic for loading a different scoring model as the base model 
     # if args.scoring_model_name:
@@ -1328,26 +1347,30 @@ if __name__ == '__main__':
     #     base_model, base_tokenizer = load_base_model_and_tokenizer(args.scoring_model_name)
     #     load_base_model()  # Load again because we've deleted/replaced the old model
 
+    if args.scoring_model_name: 
+        scoring_model = LLM(args.scoring_model_name)
+
+
     # write the data to a json file in the save folder
     with open(os.path.join(SAVE_FOLDER, "raw_data.json"), "w") as f:
         print(f"Writing raw data to {os.path.join(SAVE_FOLDER, 'raw_data.json')}")
         json.dump(data, f)
 
-    if not args.skip_baselines:
-        baseline_outputs = [run_baseline_threshold_experiment_vllm(data, get_ll_vllm, "likelihood", n_samples=n_samples)]
-        if args.openai_model is None:
-            # TODO: Change to use original text and not sampled text from `data` instead of `text`
-            rank_criterion = lambda text: -get_rank_vllm(text, log=False)
-            baseline_outputs.append(run_baseline_threshold_experiment_vllm(data, rank_criterion, "rank", n_samples=n_samples))
-            # TODO: Change to use original text and not sampled text from `data` instead of `text`
-            logrank_criterion = lambda text: -get_rank_vllm(text, log=True)
-            baseline_outputs.append(run_baseline_threshold_experiment_vllm(data, logrank_criterion, "log_rank", n_samples=n_samples))
-            # TODO: Change to use original text and not sampled text from `data` instead of `text`
-            entropy_criterion = lambda text: get_entropy_vllm(text)
-            baseline_outputs.append(run_baseline_threshold_experiment_vllm(data, entropy_criterion, "entropy", n_samples=n_samples))
+    # if not args.skip_baselines:
+    #     baseline_outputs = [run_baseline_threshold_experiment_vllm(data, get_ll_vllm, "likelihood", n_samples=n_samples)]
+    #     if args.openai_model is None:
+    #         # TODO: Change to use original text and not sampled text from `data` instead of `text`
+    #         rank_criterion = lambda text: -get_rank_vllm(text, log=False)
+    #         baseline_outputs.append(run_baseline_threshold_experiment_vllm(data, rank_criterion, "rank", n_samples=n_samples))
+    #         # TODO: Change to use original text and not sampled text from `data` instead of `text`
+    #         logrank_criterion = lambda text: -get_rank_vllm(text, log=True)
+    #         baseline_outputs.append(run_baseline_threshold_experiment_vllm(data, logrank_criterion, "log_rank", n_samples=n_samples))
+    #         # TODO: Change to use original text and not sampled text from `data` instead of `text`
+    #         entropy_criterion = lambda text: get_entropy_vllm(text)
+    #         baseline_outputs.append(run_baseline_threshold_experiment_vllm(data, entropy_criterion, "entropy", n_samples=n_samples))
 
-        baseline_outputs.append(eval_supervised_vllm(data, model='roberta-base-openai-detector'))
-        baseline_outputs.append(eval_supervised_vllm(data, model='roberta-large-openai-detector'))
+    #     baseline_outputs.append(eval_supervised_vllm(data, model='roberta-base-openai-detector'))
+    #     baseline_outputs.append(eval_supervised_vllm(data, model='roberta-large-openai-detector'))
 
     outputs = []
 
@@ -1362,33 +1385,33 @@ if __name__ == '__main__':
                 with open(os.path.join(SAVE_FOLDER, f"perturbation_{n_perturbations}_{perturbation_mode}_results.json"), "w") as f:
                     json.dump(output, f)
 
-    if not args.skip_baselines:
-        # write likelihood threshold results to a file
-        with open(os.path.join(SAVE_FOLDER, f"likelihood_threshold_results.json"), "w") as f:
-            json.dump(baseline_outputs[0], f)
+    # if not args.skip_baselines:
+    #     # write likelihood threshold results to a file
+    #     with open(os.path.join(SAVE_FOLDER, f"likelihood_threshold_results.json"), "w") as f:
+    #         json.dump(baseline_outputs[0], f)
 
-        if args.openai_model is None:
-            # write rank threshold results to a file
-            with open(os.path.join(SAVE_FOLDER, f"rank_threshold_results.json"), "w") as f:
-                json.dump(baseline_outputs[1], f)
+    #     if args.openai_model is None:
+    #         # write rank threshold results to a file
+    #         with open(os.path.join(SAVE_FOLDER, f"rank_threshold_results.json"), "w") as f:
+    #             json.dump(baseline_outputs[1], f)
 
-            # write log rank threshold results to a file
-            with open(os.path.join(SAVE_FOLDER, f"logrank_threshold_results.json"), "w") as f:
-                json.dump(baseline_outputs[2], f)
+    #         # write log rank threshold results to a file
+    #         with open(os.path.join(SAVE_FOLDER, f"logrank_threshold_results.json"), "w") as f:
+    #             json.dump(baseline_outputs[2], f)
 
-            # write entropy threshold results to a file
-            with open(os.path.join(SAVE_FOLDER, f"entropy_threshold_results.json"), "w") as f:
-                json.dump(baseline_outputs[3], f)
+    #         # write entropy threshold results to a file
+    #         with open(os.path.join(SAVE_FOLDER, f"entropy_threshold_results.json"), "w") as f:
+    #             json.dump(baseline_outputs[3], f)
         
-        # write supervised results to a file
-        with open(os.path.join(SAVE_FOLDER, f"roberta-base-openai-detector_results.json"), "w") as f:
-            json.dump(baseline_outputs[-2], f)
+    #     # write supervised results to a file
+    #     with open(os.path.join(SAVE_FOLDER, f"roberta-base-openai-detector_results.json"), "w") as f:
+    #         json.dump(baseline_outputs[-2], f)
         
-        # write supervised results to a file
-        with open(os.path.join(SAVE_FOLDER, f"roberta-large-openai-detector_results.json"), "w") as f:
-            json.dump(baseline_outputs[-1], f)
+    #     # write supervised results to a file
+    #     with open(os.path.join(SAVE_FOLDER, f"roberta-large-openai-detector_results.json"), "w") as f:
+    #         json.dump(baseline_outputs[-1], f)
 
-        outputs += baseline_outputs
+    #     outputs += baseline_outputs
 
     save_roc_curves(outputs)
     save_ll_histograms(outputs)
