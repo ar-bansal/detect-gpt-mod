@@ -329,12 +329,14 @@ def sample_from_model(texts: List[str], min_words: int = 55, prompt_tokens: int 
     elif args.use_vllm and generation_model is not None:
         sampling_params = SamplingParams(
             temperature=1.0, 
-            top_p=args.top_p if args.do_top_p else 1.0,
-            top_k=args.top_k if args.do_top_k else None, 
-            logprobs=1
+            top_p=args.top_p, 
+            top_k=args.top_k, 
+            logprobs=1, 
+            min_tokens=min_words, 
+            max_tokens=200
         )
 
-        decoded = generation_model.generate(texts, sampling_params=sampling_params, min_tokens=min_words, max_tokens=200)
+        decoded = generation_model.generate(texts, sampling_params=sampling_params)
     
     return decoded
         
